@@ -1,5 +1,5 @@
 import express from "express";
-import Redis from "ioredis";
+import { createClient } from "redis";
 import { json } from "body-parser";
 
 const DEFAULT_BALANCE = 100;
@@ -10,10 +10,11 @@ interface ChargeResult {
     charges: number;
 }
 
-async function connect(): Promise<Redis> {
+async function connect(): Promise<ReturnType<typeof createClient>> {
     const url = `redis://${process.env.REDIS_HOST ?? "localhost"}:${process.env.REDIS_PORT ?? "6379"}`;
     console.log(`Using redis URL ${url}`);
-    const client = new Redis(url);
+    const client = createClient({ url });
+    await client.connect();
     return client;
 }
 
@@ -29,13 +30,34 @@ async function reset(account: string): Promise<void> {
 async function charge(account: string, charges: number): Promise<ChargeResult> {
     const client = await connect();
     try {
-        let remainingBalance = await client.decrby(`${account}/balance`, charges);
-        if (remainingBalance >= 0) {
-            return { isAuthorized: true, remainingBalance, charges };
+        while (true) {
+            await client.watch(`${account}/balance`);        
+            const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
+            if (balance >= charges) {
+                // Begin a transaction
+                const transaction = client.multi();
+    
+                // Set the new value
+                transaction.set(`${account}/balance`, balance - charges);
+    
+                try {
+                    // Execute the transaction
+                    const result = await transaction.exec();
+        
+                    if (result) {
+                        const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
+                        return { isAuthorized: true, remainingBalance, charges };
+                    }
+                } catch (e) { // redis.exceptions.WatchError
+                    // keep on trying
+                }
+            } else {
+                return { isAuthorized: false, remainingBalance: balance, charges: 0 };
+            }
         }
-        remainingBalance = await client.incrby(`${account}/balance`, charges);
-        return { isAuthorized: false, remainingBalance, charges: 0 };
     } finally {
+        // Unwatch the key
+        await client.unwatch();
         await client.disconnect();
     }
 }
